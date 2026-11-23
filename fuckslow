@@ -1,0 +1,1110 @@
+#!/usr/bin/env python3
+"""Performance report and interactive quit menu for macOS, Linux, and Windows."""
+
+import argparse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+import ctypes
+from dataclasses import dataclass
+import os
+import plistlib
+import random
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import unicodedata
+
+if sys.platform != "win32":
+    import termios
+    import tty
+
+
+GIB = 1024**3
+MIB = 1024**2
+PRESSURE = {"1": ("正常", "normal"), "2": ("警告", "warning"), "4": ("严重", "critical")}
+LANGUAGE = "en"
+PSUTIL = None
+WINDOWS_VT = False
+APP_NAMES = {
+    "Visual Studio Code": "VS Code", "Visual Studio Code - Insiders": "VS Code Insiders",
+    "Claude": "Claude Desktop", "Docker Desktop": "Docker", "Docker": "Docker",
+    "Rancher Desktop": "Rancher Desktop", "PyCharm CE": "PyCharm",
+    "IntelliJ IDEA CE": "IntelliJ IDEA",
+}
+AGENT_EXECUTABLES = {
+    "claude": "Claude Code", "codex": "Codex CLI", "dsh": "DeepSeek Harness CLI",
+    "grok": "Grok Build", "grok-build": "Grok Build", "opencode": "OpenCode",
+    "gemini": "Gemini CLI", "cursor-agent": "Cursor Agent", "aider": "Aider",
+    "copilot": "GitHub Copilot CLI", "qwen": "Qwen Code",
+}
+AGENT_PACKAGES = {
+    "@anthropic-ai/claude-code": "Claude Code", "@openai/codex": "Codex CLI",
+    "@deepseek-ai/dsh": "DeepSeek Harness CLI", "@xai-official/grok": "Grok Build",
+    "@google/gemini-cli": "Gemini CLI", "@github/copilot": "GitHub Copilot CLI",
+    "@qwen-code/qwen-code": "Qwen Code", "opencode-ai": "OpenCode",
+}
+HELPER_NAMES = {
+    "Code Helper": "VS Code", "Code - Insiders Helper": "VS Code Insiders",
+    "Google Chrome Helper": "Google Chrome", "Microsoft Edge Helper": "Microsoft Edge",
+    "Brave Browser Helper": "Brave Browser", "Cursor Helper": "Cursor",
+    "Windsurf Helper": "Windsurf", "Slack Helper": "Slack", "Discord Helper": "Discord",
+    "com.docker.": "Docker", "qemu-system-": "QEMU",
+    "ollama": "Ollama", "ollama_llama_server": "Ollama", "prl_vm_app": "Parallels Desktop",
+    "vmware-vmx": "VMware Fusion",
+    "vmmem": "WSL / Hyper-V", "vmmemwsl": "WSL",
+}
+PORTABLE_APPS = {
+    "chrome": "Google Chrome", "chromium": "Chromium", "chromium-browser": "Chromium",
+    "msedge": "Microsoft Edge", "brave": "Brave Browser", "brave-browser": "Brave Browser",
+    "firefox": "Firefox", "code": "VS Code", "code-insiders": "VS Code Insiders",
+    "cursor": "Cursor", "windsurf": "Windsurf", "slack": "Slack", "discord": "Discord",
+    "telegram": "Telegram", "teams": "Microsoft Teams", "ms-teams": "Microsoft Teams",
+    "ollama": "Ollama", "lm studio": "LM Studio", "lm-studio": "LM Studio",
+    "docker desktop": "Docker", "com.docker.backend": "Docker",
+    "studio": "Android Studio", "studio64": "Android Studio", "idea": "IntelliJ IDEA",
+    "pycharm": "PyCharm", "claude": "Claude Desktop", "deepseek harness": "DeepSeek Harness",
+}
+SYSTEM_PROCESSES = {
+    "darwin": {
+        "com.apple.virtualization.virtualmachine": (
+            "Apple 虚拟化服务，替某个应用运行虚拟机。进程名看不出宿主，先查 Docker 或虚拟机管理器。",
+            "Apple's VM service. The name alone doesn't identify the host app. Check Docker or your VM manager.",
+        ),
+        "windowserver": (
+            "负责合成窗口和显示画面。持续高占用时，先关闲置窗口，检查外接屏和高刷设置。",
+            "Composites windows and displays. If usage stays high, close idle windows and check display settings.",
+        ),
+        "windowmanager": ("管理 macOS 窗口布局。先收起闲置窗口。", "Manages macOS window layout. Start by closing unused windows."),
+        "kernel_task": ("macOS 内核。CPU 持续很高时，检查散热和正在运行的重任务。",
+                        "macOS kernel. If CPU stays high, check cooling and active workloads."),
+        "launchd": ("启动和管理系统服务。查最近启动或反复重启的服务。", "Starts and supervises services. Look for a service that keeps restarting."),
+        "mds": ("Spotlight 索引。刚升级或导入大批文件时，先让索引跑完。",
+                "Spotlight indexing. After an upgrade or a big import, let indexing finish."),
+        "mdworker": ("Spotlight 索引工作进程。留意刚导入的大批文件。",
+                     "Spotlight indexing worker. Check whether a large import is still being indexed."),
+        "backupd": ("Time Machine 备份。去 Time Machine 看当前进度。", "Time Machine backup. Check its progress in Time Machine."),
+        "photolibraryd": ("照片图库后台任务。检查导入或 iCloud 照片同步。", "Photos library background work. Check imports or iCloud Photos sync."),
+    },
+    "win32": {
+        "dwm": ("桌面窗口管理器，负责合成窗口。先查外接屏、刷新率和显卡驱动。",
+                "Desktop Window Manager composites windows. Check displays, refresh rates, and GPU drivers."),
+        "svchost": ("Windows 服务宿主。用任务管理器按 PID 找到具体托管服务。",
+                    "Windows Service Host. Use Task Manager to identify the services behind this PID."),
+        "system": ("Windows 内核和驱动活动。持续高 CPU 时先查驱动和设备。",
+                   "Windows kernel and driver activity. For sustained high CPU, check drivers and attached devices."),
+        "memory compression": ("Windows 正在压缩内存页。先看是谁把可用内存吃光了。",
+                               "Windows is compressing memory pages. Check which apps are draining available RAM."),
+        "msmpeng": ("Microsoft Defender 扫描。打开 Windows 安全中心确认扫描状态。",
+                    "Microsoft Defender scanner. Check scan activity in Windows Security."),
+        "searchindexer": ("Windows 搜索索引。检查最近加入索引的目录。",
+                          "Windows Search indexing. Check which folders were recently added to the index."),
+        "explorer": ("Windows 桌面、任务栏和文件管理器。先关占用高的文件夹窗口。",
+                     "Windows desktop, taskbar, and File Explorer. Close heavy folder windows first."),
+        "wsl": ("WSL 虚拟机资源。用 wsl --list --running 查运行中的发行版。",
+                "WSL VM resources. Run wsl --list --running to see active distros."),
+        "wsl / hyper-v": ("虚拟机资源。先查运行中的 WSL 或 Hyper-V 实例。",
+                          "VM resources. Check which WSL or Hyper-V instances are running."),
+    },
+    "linux": {
+        "systemd": ("服务管理器。先找高占用的具体服务单元。", "Service manager. Identify the busy service unit first."),
+        "systemd-journald": ("系统日志服务。用 journalctl 看有没有服务在疯狂刷日志。",
+                            "System journal. Use journalctl to look for a service flooding the logs."),
+        "systemd-udevd": ("设备事件处理。留意反复连接或断开的外设。",
+                         "Handles device events. Check for a device repeatedly reconnecting."),
+        "systemd-logind": ("管理登录会话和用户席位。检查异常登录或会话。",
+                          "Manages logins and user sessions. Check for a session behaving unexpectedly."),
+        "kswapd": ("内核内存回收线程。持续忙通常该先查内存压力。",
+                   "Kernel memory reclaim thread. If it's persistently busy, look at memory pressure first."),
+        "kworker": ("内核后台工作线程。持续高 CPU 时检查驱动、设备及 I/O。",
+                    "Kernel worker thread. For sustained high CPU, investigate drivers, devices, and I/O."),
+        "gnome-shell": ("GNOME 桌面和窗口合成。先查扩展、窗口和显示设置。",
+                        "GNOME desktop shell and compositor. Check extensions, windows, and display settings."),
+        "xorg": ("X11 显示服务。先查高负载的图形应用和驱动。",
+                 "X11 display server. Check heavy graphics apps and GPU drivers."),
+    },
+}
+
+
+def system_note(name):
+    key = name.casefold().removesuffix(".exe").strip("[]")
+    if sys.platform == "darwin":
+        if key.startswith("mdworker_"):
+            key = "mdworker"
+    elif sys.platform == "win32":
+        key = {"vmmem": "wsl / hyper-v", "vmmemwsl": "wsl"}.get(key, key)
+    elif sys.platform == "linux":
+        if re.match(r"^kswapd\d+$", key):
+            key = "kswapd"
+        elif key.startswith("kworker/"):
+            key = "kworker"
+        elif key == "systemd-journal":
+            key = "systemd-journald"
+    note = SYSTEM_PROCESSES.get(sys.platform, {}).get(key)
+    return tr(*note) if note else ""
+
+
+@dataclass
+class Process:
+    pid: int
+    cpu: float
+    memory: int
+    name: str
+
+
+@dataclass
+class ProcessInfo:
+    parent: int
+    rss: int
+    cpu: float
+    path: str
+    uid: int | str | None
+    agent: str = ""
+    started: float | None = None
+    app: str = ""
+
+
+@dataclass
+class QuitTarget:
+    pid: int
+    name: str
+    path: str
+    started: int | float
+    signal_quit: bool
+    load: str
+
+
+@dataclass
+class Sample:
+    idle: float | None
+    processes: list
+    cpu_processes: list
+    tree: dict
+    metric: str
+    cpu_title: str
+    pressure: str
+    ram: int | None
+    available: int | None
+    compressed: int | None
+    wired: int | None
+    cache: int | None
+    used_swap: int | None
+    rates: dict
+    elapsed: float
+    disk_free: int
+
+
+class RUsageV0(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (field, ctypes.c_uint64) for field in (
+            "user_time", "system_time", "pkg_idle_wakeups", "interrupt_wakeups",
+            "pageins", "wired_size", "resident_size", "phys_footprint",
+            "start_abstime", "exit_abstime",
+        )
+    ]
+
+
+def rusage_reader():
+    try:
+        query = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage
+    except (OSError, AttributeError):
+        return lambda pid: None
+    query.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    query.restype = ctypes.c_int
+
+    def read_usage(pid):
+        usage = RUsageV0()
+        if query(pid, 0, ctypes.byref(usage)) == 0:
+            return usage
+        return None
+
+    return read_usage
+
+
+def footprints(tree):
+    usage = rusage_reader()
+    return {pid: info.phys_footprint for pid in tree if (info := usage(pid)) is not None}
+
+
+def read(*command, timeout=5):
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True, errors="replace",
+            env={**os.environ, "LC_ALL": "C"}, timeout=timeout, check=True,
+        )
+        return result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def detect_language():
+    for key in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            language = re.split(r"[-_.@]", value.lower(), maxsplit=1)[0]
+            return "zh" if language == "zh" else "en"
+    if sys.platform == "darwin":
+        languages = read("/usr/bin/defaults", "read", "-g", "AppleLanguages", timeout=1)
+        first = re.search(r'\(\s*"?([a-zA-Z]+)', languages)
+        if first and first[1].lower() == "zh":
+            return "zh"
+    if sys.platform == "win32":
+        locale_name = ctypes.create_unicode_buffer(85)
+        if ctypes.windll.kernel32.GetUserDefaultLocaleName(locale_name, len(locale_name)):
+            return "zh" if locale_name.value.lower().startswith("zh-") else "en"
+    return "en"
+
+
+def tr(chinese, english):
+    return chinese if LANGUAGE == "zh" else english
+
+
+def size(value):
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([BKMGT]?)[*+-]*", value)
+    if match is None:
+        return None
+    number, unit = match.groups()
+    return int(float(number) * 1024 ** "BKMGT".index(unit or "B"))
+
+
+def amount(value):
+    if value is None:
+        return tr("未知", "unknown")
+    if value >= GIB:
+        return f"{value / GIB:.2f} GiB"
+    return f"{value / MIB:.1f} MiB"
+
+
+def vm_snapshot():
+    output = read("/usr/bin/vm_stat")
+    page = re.search(r"page size of (\d+) bytes", output)
+    if not page:
+        return {}
+    return {
+        "Page size": int(page[1]),
+        **{
+            key: int(value) * int(page[1])
+            for key, value in re.findall(r"^([^:\n]+):\s+(\d+)\.", output, re.M)
+        },
+    }
+
+
+def parse_top(output):
+    samples = re.split(r"^Processes:", output, flags=re.M)
+    if len(samples) < 3:
+        return None, []
+    sample = samples[-1]
+    idle = re.search(r"CPU usage:.*?([\d.]+)% idle", sample)
+    processes = []
+    for line in sample.splitlines():
+        fields = line.split(maxsplit=3)
+        if len(fields) != 4 or not fields[0].isdigit():
+            continue
+        pid, cpu, memory, name = fields
+        memory = size(memory)
+        if memory is not None and re.fullmatch(r"\d+(?:\.\d+)?", cpu):
+            processes.append(Process(int(pid), float(cpu), memory, name))
+    return float(idle[1]) if idle else None, processes
+
+
+def process_tree(output):
+    tree = {}
+    for line in output.splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and all(field.isdigit() for field in fields[:4]):
+            pid, parent, rss, uid, cpu, path = fields
+            if re.fullmatch(r"\d+(?:\.\d+)?", cpu):
+                tree[int(pid)] = ProcessInfo(int(parent), int(rss) * 1024, float(cpu), path, int(uid))
+    return tree
+
+
+def identify_agent(path, command="", entry_script=None):
+    executable = os.path.basename(path)
+    if sys.platform == "win32":
+        path = path.replace("\\", "/")
+        executable = os.path.basename(path).lower().removesuffix(".exe")
+    if executable == "dsh":
+        resolved = os.path.realpath(path).replace("\\", "/")
+        return AGENT_EXECUTABLES[executable] if any(
+            marker in resolved for marker in ("/@deepseek-ai/dsh/", "/DeepSeek Harness.app/")
+        ) else ""
+    if ".app/" in path:
+        if "/DeepSeek Harness.app/" in path and command.startswith(path + " "):
+            entry = command[len(path) + 1:].removeprefix("--expose-internals ")
+            if re.match(r".*?/DeepSeek Harness\.app/Contents/Resources/runtime/cli/", entry):
+                return "DeepSeek Harness CLI"
+        return ""
+    if executable in AGENT_EXECUTABLES:
+        return AGENT_EXECUTABLES[executable]
+    if re.search(r"/\.local/share/claude/versions/[\d.]+$", path):
+        return "Claude Code"
+    if not re.fullmatch(r"node(?:js)?|bun|electron", executable, re.I):
+        return ""
+    # Only inspect the entry script, never provider names or script arguments.
+    if entry_script is None:
+        _, _, script = command.partition(" ")
+        script = script.removeprefix("--expose-internals ")
+        script = script.lstrip().split(maxsplit=1)[0] if script.strip() else ""
+    else:
+        script = entry_script.replace("\\", "/")
+    if not script or script.startswith("-"):
+        return ""
+    for package, name in AGENT_PACKAGES.items():
+        if f"/node_modules/{package}/" in script:
+            return name
+    if "/node_modules/.bin/" in script:
+        return AGENT_EXECUTABLES.get(os.path.basename(script), "")
+    return ""
+
+
+def tag_agents(tree, output):
+    commands = {}
+    for line in output.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) == 2 and fields[0].isdigit():
+            commands[int(fields[0])] = fields[1]
+    for pid, info in tree.items():
+        info.agent = identify_agent(info.path, commands.get(pid, ""))
+
+
+def app_group(process, tree):
+    if system_note(process.name):
+        return process.name
+    pid = process.pid
+    visited = set()
+    while pid in tree and pid not in visited:
+        visited.add(pid)
+        info = tree[pid]
+        path = info.path
+        executable = os.path.basename(path)
+        if executable.startswith("qemu-system") and "/emulator/qemu/" in path.replace("\\", "/"):
+            return "Android Emulator"
+        if executable.startswith(("Codex (", "Codex Helper")):
+            return "Codex"
+        if info.agent:
+            return info.agent
+        if info.app:
+            return info.app
+        app = re.search(r"(?:^|/)([^/]+)\.app/", path)
+        if app:
+            return APP_NAMES.get(app[1], app[1])
+        if executable in HELPER_NAMES:
+            return HELPER_NAMES[executable]
+        if executable.startswith("com.docker."):
+            return "Docker"
+        if executable.startswith("qemu-system-"):
+            return "QEMU"
+        pid = info.parent
+    name = process.name
+    if name.startswith(("Codex (", "Codex Helper")):
+        return "Codex"
+    for prefix, app in HELPER_NAMES.items():
+        if name == prefix or name.startswith(prefix + " (") or (
+            prefix.endswith((".", "-")) and name.startswith(prefix)
+        ):
+            return app
+    return name
+
+
+def action(name, members):
+    if name in AGENT_EXECUTABLES.values():
+        if sys.platform == "win32":
+            return tr("先让 Agent 干完活。菜单会强制结束选中的 PID。",
+                      "Let the agent finish first. The menu force-stops only the selected PID.")
+        return tr("先确认 Agent 没在干活，再回终端退出。菜单只会给选中的 PID 发 SIGTERM。",
+                  "Let the agent finish before quitting its session. The menu sends SIGTERM only to the selected PID.")
+    if name == "DeepSeek Harness":
+        return tr("先保存会话，停掉在跑的活儿，再退出桌面端。", "Save the session and stop active jobs before quitting.")
+    if name == "Claude Desktop":
+        return tr("先停闲置任务、关掉不用的会话，再退出。", "Wrap up idle tasks and close unused sessions before quitting.")
+    if name in {"Cursor", "Windsurf", "VS Code Insiders", "IntelliJ IDEA", "PyCharm", "Android Studio", "Xcode"}:
+        return tr("把八百年没碰的工作区关了，再看索引、扩展和调试会话。",
+                  "Close stale workspaces, then check indexing, extensions, and debug sessions.")
+    if name in {"Microsoft Edge", "Brave Browser", "Chromium", "Firefox", "Safari"}:
+        return tr("先清理那堆吃内存还不干活的标签页和扩展。", "Close memory-heavy tabs and extensions you're not using.")
+    if name in {"Ollama", "LM Studio"}:
+        return tr("先停闲置推理，再卸载模型。Ollama 用 ollama ps 看谁赖着不走。",
+                  "Stop idle inference and unload unused models. For Ollama, run ollama ps to see what's loaded.")
+    if name in {"OrbStack", "Rancher Desktop", "Parallels Desktop", "VMware Fusion", "UTM", "Colima", "Lima"}:
+        return tr("确认容器和虚拟机没在跑正事，再正常关闭闲置实例。",
+                  "Check for active jobs, then shut down idle VMs or containers from their manager.")
+    if name in {"WSL", "WSL / Hyper-V"}:
+        return tr("先看哪个 WSL 发行版或 Hyper-V 虚拟机在跑，保存任务后再停。",
+                  "Find the WSL distro or Hyper-V VM that's running, save its work, then stop it.")
+    if name in {"Slack", "Discord", "Microsoft Teams", "zoom.us", "WeChat", "Figma"}:
+        return tr("先结束通话和共享，关掉大文件页面，再退出。",
+                  "End any idle calls or screen shares and close large documents before quitting.")
+    if name == "Android Emulator":
+        return tr("调试或测试能停的话，去 Android Studio 的 Device Manager 把闲置模拟器关了。",
+                  "If debugging or tests can stop, shut down the idle emulator in Android Studio’s Device Manager.")
+    if name == "QEMU" or any(p.name.startswith("qemu-system") for p in members):
+        return tr("搞清楚是哪台虚拟机，保存工作，再从管理界面关闭。",
+                  "Identify the VM, save your work, and shut it down from its manager.")
+    if name == "VS Code":
+        return tr("保存代码，关掉闲置工作区。老是吃内存就用 Developer: Open Process Explorer 查扩展或语言服务。",
+                  "Save your code and close idle workspaces. Run Developer: Open Process Explorer to track down hungry extensions or language servers.")
+    if name == "Google Chrome":
+        return tr("去 Chrome 的「窗口 → 任务管理器」，先关吃内存最多的闲置标签页。",
+                  "Open Chrome’s Window → Task Manager and close the hungriest unused tabs first.")
+    if name == "Codex":
+        return tr("等任务跑完，关掉闲置聊天窗口。还他妈占这么多的话，退出重开。",
+                  "Let active jobs finish and close unused chats. If usage stays high, restart Codex.")
+    if name == "Docker":
+        return tr("确认服务能停，再用 Docker Desktop 关闲置容器或退出。",
+                  "Check that your services can stop, then stop idle containers or quit Docker Desktop.")
+    if name in {"WindowServer", "kernel_task", "launchd"}:
+        return tr("这是系统进程，先收拾闲置窗口和应用，再测。", "This is a system process. Close idle windows and apps, then rerun.")
+    return tr("先搞清它在干嘛。闲置 App 保存后退出，后台任务先找它归谁管。",
+              "Check what it's doing. Save and quit idle apps, or identify what owns the background job.")
+
+
+def ansi_terminal():
+    if sys.platform == "win32":
+        return sys.stdout.isatty() and WINDOWS_VT
+    return sys.stdout.isatty() and os.environ.get("TERM") not in {None, "dumb"}
+
+
+def enable_windows_vt():
+    from ctypes import wintypes
+
+    kernel = ctypes.windll.kernel32
+    kernel.GetStdHandle.restype = wintypes.HANDLE
+    handle = kernel.GetStdHandle(-11)
+    mode = wintypes.DWORD()
+    return bool(kernel.GetConsoleMode(wintypes.HANDLE(handle), ctypes.byref(mode))
+                and kernel.SetConsoleMode(wintypes.HANDLE(handle), mode.value | 4))
+
+
+def color_enabled():
+    return ansi_terminal() and "NO_COLOR" not in os.environ
+
+
+def style(message, code):
+    if color_enabled():
+        return f"\033[{code}m{message}\033[0m"
+    return message
+
+
+def type_line(message, animate, code="0"):
+    if not animate:
+        print(style(message, code), flush=True)
+        return
+    colored = color_enabled()
+    if colored:
+        sys.stdout.write(f"\033[{code}m")
+    try:
+        for offset in range(0, len(message), 3):
+            print(message[offset:offset + 3], end="", flush=True)
+            time.sleep(0.009)
+    finally:
+        print("\033[0m" if colored else "", flush=True)
+
+
+def heading(label):
+    print("\n" + style(f"━━ {label} ━━", "1;36"))
+
+
+def roast(pressure, swap_rate, busy_cpu, low_disk, measured):
+    if pressure == "4" or swap_rate >= 100 * MIB:
+        return tr("🔥 你电脑真他妈卡爆了。内存撑成傻逼，硬盘还得替它擦屁股。",
+                  "🔥 Holy shit, your RAM is cooked. The SSD just got paged in as on-call.")
+    if pressure == "2" or swap_rate >= 10 * MIB:
+        return tr("💩 内存都挤成一坨屎了。那几个光吃不干的，赶紧滚蛋。",
+                  "🍽️ Your apps are treating RAM like an all-you-can-eat buffet. Kick out a few freeloaders.")
+    if busy_cpu:
+        return tr("🥵 CPU 他妈快搓冒烟了。看看哪个逼玩意儿在抽它。",
+                  "🥵 Your CPU is hauling ass. Who the hell started a build inside a build?")
+    if low_disk:
+        return tr("🚽 启动盘塞得跟屎坑似的。腾点地儿，别他妈再往里倒了。",
+                  "🚨 Your disk is one npm install away from a crime scene.")
+    if measured:
+        return random.choice(tr((
+            "🤨 我怀疑你tm在逗我玩。电脑这几秒跑得比你下班还快。",
+            "👀 电脑挺利索啊。检查一下显示器、眼睛，或者你小子就是闲得蛋疼。",
+            "🐟 CPU 在摸鱼，内存也没造反。哪个逼喊卡的，出来走两步。",
+        ), (
+            "🤨 Your machine looks fine. Bold of you to open a Sev 1 over vibes.",
+            "🧊 The CPU is chilling. Have you tried turning your expectations off and back on?",
+            "☕ Nothing's on fire. Close this ticket with 'can't reproduce' and go get coffee.",
+        )))
+    return tr("🤷 这破探针他妈掉链子了。证据不够，先别瞎喷。",
+              "🤷 Well, shit. The probe missed some data. Save the postmortem for when we have evidence.")
+
+
+def terminal_text(value):
+    return "".join(char for char in value if char.isprintable())
+
+
+def is_main_app(path):
+    bundle, separator, remainder = path.partition(".app/")
+    prefix = "Contents/MacOS/"
+    if not separator or not bundle.startswith("/") or not remainder.startswith(prefix):
+        return False
+    executable = remainder[len(prefix):]
+    if not executable or "/" in executable:
+        return False
+    try:
+        with open(bundle + ".app/Contents/Info.plist", "rb") as file:
+            return plistlib.load(file).get("CFBundleExecutable") == executable
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
+
+
+def quit_targets(names, groups, tree, cpu_first, limit):
+    ancestors = set()
+    pid = os.getpid()
+    while pid in tree and pid not in ancestors:
+        ancestors.add(pid)
+        pid = tree[pid].parent
+    ancestors.add(os.getppid())
+    mac = sys.platform == "darwin"
+    usage = rusage_reader() if mac else None
+    owner = os.getuid() if sys.platform != "win32" else PSUTIL.Process().username()
+    targets = []
+    for name in names:
+        members = groups[name]
+        field = "cpu" if cpu_first else "memory"
+        for process in sorted(members, key=lambda p: getattr(p, field), reverse=True):
+            pid = process.pid
+            info = tree.get(pid)
+            if info is None or info.uid != owner or pid <= 1 or pid in ancestors or system_note(process.name):
+                continue
+            path = info.path
+            if path.startswith(("/System/", "/usr/libexec/")):
+                continue
+            emulator = name == "Android Emulator" and process.name.startswith("qemu-system")
+            parent = tree.get(info.parent)
+            agent = bool(info.agent and (parent is None or parent.agent != info.agent))
+            portable_app = (not mac and info.app and os.path.isabs(path)
+                            and (parent is None or parent.app != info.app))
+            signal_quit = emulator or agent or bool(portable_app)
+            if not signal_quit and not is_main_app(path):
+                continue
+            identity = usage(pid) if mac else None
+            started = identity.start_abstime if identity else info.started
+            if not started:
+                continue
+            if signal_quit:
+                load = f"{process.cpu:.1f}%" if cpu_first else amount(process.memory)
+            else:
+                load = (f"{sum(p.cpu for p in members):.1f}%" if cpu_first
+                        else amount(sum(p.memory for p in members))) + tr("（应用组）", " (app group)")
+            targets.append(QuitTarget(pid, name, path, started, signal_quit, load))
+        if len(targets) >= limit:
+            break
+    return targets[:limit]
+
+
+QUIT_APP_SCRIPT = """
+ObjC.import('AppKit');
+function run(argv) {
+    var app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(argv[0]));
+    if (app.isNil() || ObjC.unwrap(app.executableURL.path) !== argv[1]) return 'refused';
+    return app.terminate ? 'sent' : 'refused';
+}
+"""
+
+
+def request_quit(target):
+    if sys.platform != "darwin":
+        return request_portable_quit(target)
+    usage = rusage_reader()
+    current = usage(target.pid)
+    if current is None or current.start_abstime != target.started:
+        return tr("进程已退出或身份变了。重新扫描再选。", "Process exited or its identity changed. Rerun before selecting it again."), False
+    try:
+        if target.signal_quit:
+            os.kill(target.pid, signal.SIGTERM)
+        elif read("/usr/bin/osascript", "-l", "JavaScript", "-e", QUIT_APP_SCRIPT,
+                  str(target.pid), target.path).strip() != "sent":
+            return tr("macOS 没有确认退出请求。请检查应用窗口或手动退出。", "macOS didn't acknowledge the quit request. Check the app or quit it manually."), False
+    except OSError:
+        return tr("退出请求没发出去。进程可能已退出，或系统拒绝了操作。", "Couldn't send the quit request. The process may have exited, or macOS denied it."), False
+    for attempt in range(50):
+        current = usage(target.pid)
+        if current is not None and current.start_abstime != target.started:
+            return tr("💥 FUCK IT. 目标已退出。", "💥 FUCK IT. Target exited."), True
+        if current is None:
+            try:
+                os.kill(target.pid, 0)
+            except ProcessLookupError:
+                return tr("💥 FUCK IT. 目标已退出。", "💥 FUCK IT. Target exited."), True
+            except PermissionError:
+                pass
+        if attempt % 10 == 0:
+            state = read("/bin/ps", "-p", str(target.pid), "-o", "state=", timeout=1).strip()
+            if state.startswith("Z"):
+                return tr("💥 FUCK IT. 目标已退出。", "💥 FUCK IT. Target exited."), True
+        time.sleep(0.1)
+    return tr("已发出退出请求，进程仍在运行。去应用里看看有没有保存提示。", "Quit requested. Still running. Check the app for a save prompt."), False
+
+
+def request_portable_quit(target):
+    try:
+        process = PSUTIL.Process(target.pid)
+        if process.create_time() != target.started:
+            return tr("PID 换人了，重新扫描再选。", "PID was reused. Rerun before selecting it again."), False
+        process.terminate()
+        process.wait(timeout=5)
+    except PSUTIL.NoSuchProcess:
+        pass
+    except PSUTIL.TimeoutExpired:
+        return tr("发了退出请求，还在跑。", "Termination requested. Still running."), False
+    except (PSUTIL.AccessDenied, OSError):
+        return tr("系统拒绝了关闭操作。", "The system denied termination."), False
+    return tr("💥 FUCK IT. 目标已退出。", "💥 FUCK IT. Target exited."), True
+
+
+def fit_line(message, columns):
+    end = 0
+    for char in message:
+        columns -= 2 if unicodedata.east_asian_width(char) in {"W", "F", "A"} else 1
+        if columns < 0:
+            break
+        end += 1
+    return message[:end]
+
+
+def choose_targets(rows, animate):
+    prompt = tr("多选（如 123 或 32，回车锁定）› ", "Pick numbers (e.g. 123 or 32), then Enter › ")
+    valid = {str(index) for index in range(1, len(rows) + 1)}
+    if not animate or shutil.get_terminal_size().lines <= len(rows) + 2:
+        for row in rows:
+            print(row)
+        while True:
+            digits = input(prompt).strip()
+            if all(digit in valid for digit in digits):
+                return list(dict.fromkeys(digits))
+            print(tr("请输入榜上的编号，或者回车跳过。", "Use a number from the list, or press Enter to skip."))
+
+    selected = []
+    columns = shutil.get_terminal_size().columns
+
+    def draw(offset=0, active="", redraw=False):
+        if redraw:
+            sys.stdout.write(f"\r\033[{len(rows)}A")
+        for index, row in enumerate(rows, 1):
+            digit = str(index)
+            line = fit_line((" " * offset if active == digit else "") + row, columns - 1)
+            if redraw:
+                sys.stdout.write("\r\033[2K")
+            sys.stdout.write(style(line, "1;31") if digit in selected else line)
+            sys.stdout.write("\n")
+        if redraw:
+            sys.stdout.write("\r\033[2K")
+        sys.stdout.write(fit_line(prompt + "".join(selected), columns - 1))
+        sys.stdout.flush()
+
+    if sys.platform == "win32":
+        import msvcrt
+
+        def read_key():
+            key = msvcrt.getwch()
+            if key in {"\x00", "\xe0"}:
+                msvcrt.getwch()
+                return " "
+            if key == "\x03":
+                raise KeyboardInterrupt
+            return key
+    else:
+        fd = sys.stdin.fileno()
+        settings = termios.tcgetattr(fd)
+
+        def read_key():
+            raw = os.read(fd, 1)
+            return raw.decode("ascii", errors="replace")
+    draw()
+    try:
+        if sys.platform != "win32":
+            tty.setcbreak(fd)
+        while True:
+            key = read_key()
+            if key in {"", "\x04", "\r", "\n"}:
+                return selected if key in {"\r", "\n"} else []
+            if key in {"\x7f", "\b"} and selected:
+                selected.pop()
+                draw(redraw=True)
+            elif key in valid and key not in selected:
+                selected.append(key)
+                for offset in (3, 0, 2, 0):
+                    draw(offset, key, redraw=True)
+                    time.sleep(0.035)
+    finally:
+        if sys.platform != "win32":
+            termios.tcsetattr(fd, termios.TCSADRAIN, settings)
+        print()
+
+
+def attack(target, animate):
+    name = terminal_text(target.name)
+    label = f"{name} · PID {target.pid}"
+    if not animate:
+        type_line(tr(f"正在关闭 {label}…", f"Quitting {label}…"), False)
+        return request_quit(target)
+
+    columns = shutil.get_terminal_size().columns
+    frames = ("✦", "⚡", "✷", "💥")
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(request_quit, target)
+        frame = 0
+        try:
+            while True:
+                effect = frames[frame % len(frames)]
+                line = f"{' ' * (frame % 3)}{effect} FUCK IT  ›  {label}"
+                print("\r\033[2K" + style(fit_line(line, columns - 1), "1;31"), end="", flush=True)
+                try:
+                    return pending.result(timeout=0.10)
+                except FutureTimeout:
+                    frame += 1
+        finally:
+            print("\r\033[2K", end="", flush=True)
+
+
+def quit_menu(targets, animate):
+    heading(tr("03  FUCK IT · 关闭候选", "03  FUCK IT · Quit candidates"))
+    if not targets:
+        print(tr("这次没有能直接关闭的候选。", "No targets can be quit from here."))
+        return
+    rows = []
+    for index, target in enumerate(targets, 1):
+        if sys.platform == "win32":
+            mode = tr("强制结束进程", "Force-stop process")
+        elif target.signal_quit:
+            mode = tr("结束进程（SIGTERM）", "Stop process (SIGTERM)")
+        else:
+            mode = tr("正常退出应用", "Quit app normally")
+        rows.append(f"  [{index}] {terminal_text(target.name)} · {target.load} · PID {target.pid} · {mode}")
+    try:
+        digits = choose_targets(rows, animate)
+        if not digits:
+            return
+        selected = [targets[int(digit) - 1] for digit in digits]
+        names = tr("、", ", ").join(terminal_text(target.name) for target in selected)
+        print(tr(f"已选 {names}", f"Selected: {names}"), flush=True)
+        if input(tr("你确定都保存了？丢了东西可tm不关我事！输入 y 确认 › ", "Saved your shit? Lost work is on you. Type y to confirm › ")).strip().lower() != "y":
+            print(tr("取消了。", "Canceled."))
+            return
+        failures = []
+        for target in selected:
+            message, exited = attack(target, animate)
+            name = terminal_text(target.name)
+            type_line(f"{name} · PID {target.pid}  {message}", animate, "1;32" if exited else "1;33")
+            if not exited:
+                failures.append(f"{name}（PID {target.pid}）")
+        if failures:
+            failed = tr("、", ", ").join(failures)
+            type_line(tr(f"这东西 {failed} 我关不掉，你tm还是自己来吧！",
+                         f"Couldn't quit {failed}. This one's your damn problem now."),
+                      animate, "1;31")
+        else:
+            count = len(selected)
+            type_line(tr(f"💥 干掉 {count}/{count} 个。完事。", f"💥 {count}/{count} targets gone. Done."),
+                      animate, "1;32")
+    except (EOFError, KeyboardInterrupt):
+        print(tr("\n已离开关闭菜单。", "\nQuit menu closed."))
+
+
+def sample_mac(seconds):
+    start = time.monotonic()
+    before = vm_snapshot()
+    idle, processes = parse_top(read(
+        "/usr/bin/top", "-l", "2", "-s", str(seconds),
+        "-stats", "pid,cpu,mem,command", timeout=seconds + 4,
+    ))
+    remaining = seconds - (time.monotonic() - start)
+    if remaining > 0:
+        time.sleep(remaining)
+    after = vm_snapshot()
+    elapsed = time.monotonic() - start
+    tree = process_tree(read("/bin/ps", "-ww", "-axo", "pid=,ppid=,rss=,uid=,%cpu=,comm="))
+    interpreters = [
+        str(pid) for pid, info in tree.items()
+        if os.path.basename(info.path).lower() in {"node", "nodejs", "bun", "electron"}
+        or "/DeepSeek Harness.app/Contents/MacOS/" in info.path
+    ]
+    agent_args = read("/bin/ps", "-ww", "-p", ",".join(interpreters), "-o", "pid=,args=") if interpreters else ""
+    tag_agents(tree, agent_args)
+    for process in processes:
+        if process.pid in tree:
+            process.name = os.path.basename(tree[process.pid].path)
+        else:
+            process.name = process.name.strip()
+    used_top = bool(processes)
+    cpu_processes = processes
+    metric = tr("内存占用", "Memory footprint")
+    if not used_top and tree:
+        usage = footprints(tree)
+        cpu_processes = [
+            Process(pid, info.cpu, info.rss, os.path.basename(info.path))
+            for pid, info in tree.items()
+        ]
+        if usage:
+            metric = tr("物理内存占用（footprint）", "Physical memory footprint")
+            processes = [
+                Process(p.pid, p.cpu, usage[p.pid], p.name)
+                for p in cpu_processes if p.pid in usage
+            ]
+        else:
+            metric = tr("常驻内存 RSS", "Resident memory (RSS)")
+            processes = cpu_processes
+
+    pressure = read("/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level").strip()
+    swap_text = read("/usr/sbin/sysctl", "-n", "vm.swapusage")
+    swap = re.search(r"used\s*=\s*([\d.]+\s*[BKMGT])", swap_text)
+    ram = size(read("/usr/sbin/sysctl", "-n", "hw.memsize").strip())
+    storage = shutil.disk_usage("/System/Volumes/Data" if os.path.isdir("/System/Volumes/Data") else "/")
+    rates = {}
+    for key in ("Swapins", "Swapouts"):
+        if key in before and key in after and after[key] >= before[key]:
+            rates[key] = (after[key] - before[key]) / elapsed
+    cpu_title = "CPU" if used_top else tr("CPU（ps 近期估计）", "CPU (recent estimate from ps)")
+    return Sample(
+        idle, processes, cpu_processes, tree, metric, cpu_title, pressure, ram,
+        sum(snapshot.get(key, 0) for key in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable")),
+        after.get("Pages occupied by compressor"), after.get("Pages wired down"),
+        after.get("File-backed pages"), size(swap[1]) if swap else None, rates, elapsed, storage.free,
+    )
+
+
+def process_cpu(info):
+    times = info["cpu_times"]
+    return times.user + times.system if times is not None else None
+
+
+def sample_portable(seconds):
+    windows = sys.platform == "win32"
+    owner_field = "username" if windows else "uids"
+    start_swap = PSUTIL.swap_memory()
+    PSUTIL.cpu_percent(interval=None)
+    started = time.monotonic()
+    before = {
+        proc.pid: (proc.info["create_time"], process_cpu(proc.info))
+        for proc in PSUTIL.process_iter(["create_time", "cpu_times"])
+    }
+    time.sleep(max(0, seconds - (time.monotonic() - started)))
+    elapsed = time.monotonic() - started
+    idle = 100 - PSUTIL.cpu_percent(interval=None)
+    memory = PSUTIL.virtual_memory()
+    swap = PSUTIL.swap_memory()
+    rates = {} if windows else {
+        "Swapins": max(0, swap.sin - start_swap.sin) / elapsed,
+        "Swapouts": max(0, swap.sout - start_swap.sout) / elapsed,
+    }
+    available_ratio = memory.available / memory.total if memory.total else 1
+    pressure = "4" if available_ratio < 0.05 else "2" if available_ratio < 0.12 else "1"
+    tree, processes, cpu_processes = {}, [], []
+    PSUTIL.process_iter.cache_clear()
+    attrs = ["name", "exe", "ppid", "create_time", "memory_info", "cpu_times", owner_field]
+    for proc in PSUTIL.process_iter(attrs):
+        info = proc.info
+        pid = proc.pid
+        name = info["name"] or f"PID {pid}"
+        path = info["exe"] or name
+        executable = name.lower().removesuffix(".exe")
+        app = PORTABLE_APPS.get(executable, "")
+        if executable in {"vmmem", "vmmemwsl"}:
+            # Report VM memory without offering to stop the host process.
+            name = HELPER_NAMES[executable]
+        # Claude Code and Claude Desktop can have similar executable names.
+        claude_desktop = executable == "claude" and name in {"Claude", "Claude.exe"} and bool(info["exe"])
+        if executable == "claude" and not claude_desktop:
+            app = ""
+        agent = "" if claude_desktop else identify_agent(path)
+        runtime = os.path.basename(path).lower().removesuffix(".exe")
+        if runtime in {"node", "nodejs", "bun", "electron"}:
+            try:
+                argv = proc.cmdline()
+                if len(argv) >= 2:
+                    entry = argv[2] if argv[1] == "--expose-internals" and len(argv) > 2 else argv[1]
+                    agent = identify_agent(path, entry_script=entry)
+            except (PSUTIL.NoSuchProcess, PSUTIL.AccessDenied):
+                pass
+        owner = info[owner_field]
+        if not windows and owner is not None:
+            owner = owner.real
+        creation = info["create_time"]
+        previous_creation, previous_cpu = before.get(pid, (None, None))
+        current_cpu = process_cpu(info)
+        cpu = 0
+        if creation == previous_creation and previous_cpu is not None and current_cpu is not None:
+            cpu = max(0, current_cpu - previous_cpu) * 100 / elapsed
+        rss = info["memory_info"].rss if info["memory_info"] is not None else 0
+        tree[pid] = ProcessInfo(info["ppid"], rss, cpu, path, owner, agent, creation, app)
+        process = Process(pid, cpu, rss, name)
+        if rss:
+            processes.append(process)
+        if current_cpu is not None:
+            cpu_processes.append(process)
+    root = os.environ.get("SystemDrive", "C:") + "\\" if windows else "/"
+    return Sample(
+        idle, processes, cpu_processes, tree, tr("常驻内存 RSS", "Resident memory (RSS)"),
+        "CPU", pressure, memory.total, memory.available, None, None, getattr(memory, "cached", None),
+        swap.used, rates, elapsed, shutil.disk_usage(root).free,
+    )
+
+
+def show_memory_tail(names, groups, limit, animate):
+    remaining = names[limit:]
+    if not remaining:
+        return
+    usage = {name: sum(p.memory for p in groups[name]) for name in remaining}
+    size_total = amount(sum(usage.values()))
+    process_count = sum(len(groups[name]) for name in remaining)
+    type_line(tr(f"榜外内存｜{len(remaining)} 组、{process_count} 个进程，加总读数 {size_total}",
+                 f"Beyond the top list | {len(remaining)} groups, {process_count} processes, {size_total} summed"),
+              animate)
+    top = " · ".join(f"{terminal_text(name)} {amount(usage[name])}" for name in remaining[:3])
+    type_line(tr(f"  榜外占用最高 {top}", f"  Biggest outside the top list: {top}"), animate)
+    small = [name for name in remaining if usage[name] < 256 * MIB]
+    if small:
+        small_total = amount(sum(usage[name] for name in small))
+        type_line(tr(f"  零碎小户｜{len(small)} 组各低于 256 MiB，合计 {small_total}",
+                     f"  Small groups | {len(small)} under 256 MiB each, {small_total} combined"), animate)
+
+
+def main():
+    global LANGUAGE, PSUTIL, WINDOWS_VT
+    LANGUAGE = detect_language()
+    parser = argparse.ArgumentParser(prog="fuckslow", description=tr("看是谁把电脑拖慢了，先关哪个", "Find what's slowing down your computer and what to quit first"))
+    parser.add_argument("--seconds", type=int, choices=range(1, 11), default=2,
+                        metavar="1–10", help=tr("CPU 和交换采样间隔（默认 2 秒）", "CPU and swap sample interval (default: 2 seconds)"))
+    parser.add_argument("--limit", type=int, default=5, help=tr("每个榜单显示的应用组数（默认 5）", "App groups per ranking (default: 5)"))
+    parser.add_argument("--report-only", action="store_true", help=tr("只输出报告", "Print the report only"))
+    parser.add_argument("--no-animation", action="store_true", help=tr("关闭打字机和晃动效果", "Disable typing and shake effects"))
+    args = parser.parse_args()
+    if args.limit < 1:
+        parser.error(tr("--limit 必须大于 0", "--limit must be greater than zero"))
+    if sys.platform not in {"darwin", "linux", "win32"}:
+        parser.exit(2, tr("支持 macOS、Linux 和 Windows。\n", "Supported platforms: macOS, Linux, and Windows.\n"))
+    if sys.platform != "darwin":
+        try:
+            import psutil as process_library
+        except ImportError:
+            python = "python" if sys.platform == "win32" else "python3"
+            command = f'{python} -m pip install "psutil>=6,<8"'
+            parser.exit(2, tr(f"请先安装采集库：{command}\n", f"Install the sampler first: {command}\n"))
+        PSUTIL = process_library
+    if sys.platform == "win32":
+        if sys.stdout.isatty():
+            WINDOWS_VT = enable_windows_vt()
+        else:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+    interactive = not args.report_only and sys.stdin.isatty() and sys.stdout.isatty()
+    animate = interactive and not args.no_animation and ansi_terminal()
+    type_line(tr("⚡ FUCKING SLOW  /  正在采集内存、交换和 CPU…", "⚡ FUCKING SLOW  /  Sampling memory, swap, and CPU…"), animate, "1;35")
+    sample = sample_mac(args.seconds) if sys.platform == "darwin" else sample_portable(args.seconds)
+    idle, processes, cpu_processes, tree = sample.idle, sample.processes, sample.cpu_processes, sample.tree
+    pressure, rates = sample.pressure, sample.rates
+
+    groups = defaultdict(list)
+    for process in processes:
+        groups[app_group(process, tree)].append(process)
+    cpu_groups = groups
+    if cpu_processes is not processes:
+        cpu_groups = defaultdict(list)
+        for process in cpu_processes:
+            cpu_groups[app_group(process, tree)].append(process)
+    by_memory = sorted(groups, key=lambda name: sum(p.memory for p in groups[name]), reverse=True)
+    by_cpu = sorted(cpu_groups, key=lambda name: sum(p.cpu for p in cpu_groups[name]), reverse=True)
+
+    busy_cpu = idle is not None and idle < 15
+    swap_rate = sum(rates.values())
+    active_swap = swap_rate >= 10 * MIB
+    low_disk = sample.disk_free < 10 * GIB
+    findings = []
+    if active_swap:
+        findings.append(tr("采样期间交换频繁，优先降低内存负载", "Heavy swap activity. Reduce memory load first."))
+    elif pressure in {"2", "4"}:
+        findings.append(tr("内存压力偏高，优先检查高占用应用", "Elevated memory pressure. Check the heavy hitters first."))
+    if busy_cpu:
+        findings.append(tr("采样期间 CPU 接近满载", "CPU was nearly saturated during sampling."))
+    if low_disk:
+        findings.append(tr("启动盘可用空间低于 10 GiB", "Startup disk has less than 10 GiB free."))
+    measured = pressure in PRESSURE and idle is not None and (len(rates) == 2 or sys.platform == "win32")
+    heading(tr("01  内存和 CPU 采集分析", "01  Memory and CPU analysis"))
+    level = tr(*PRESSURE.get(pressure, ("未知", "unknown")))
+    used_swap = amount(sample.used_swap)
+    swap_in = amount(rates.get("Swapins"))
+    swap_out = amount(rates.get("Swapouts"))
+    pressure_label = tr("压力", "pressure") if sys.platform == "darwin" else tr("压力估算", "estimated pressure")
+    type_line(tr(f"内存｜{pressure_label} {level} · RAM {amount(sample.ram)} · 已用交换 {used_swap}",
+                 f"Memory | {pressure_label} {level} · RAM {amount(sample.ram)} · swap used {used_swap}"), animate)
+    system_memory = [
+        f"{label} {amount(value)}" for label, value in (
+            (tr("可用", "available"), sample.available),
+            (tr("联动内存", "wired"), sample.wired),
+            (tr("压缩", "compressed"), sample.compressed),
+            (tr("文件页", "file-backed pages") if sys.platform == "darwin" else tr("缓存", "cache"), sample.cache),
+        ) if value is not None
+    ]
+    if system_memory:
+        type_line(tr("系统内存｜", "System memory | ") + " · ".join(system_memory), animate)
+    if rates:
+        type_line(tr(f"交换｜最近 {sample.elapsed:.1f} 秒平均，每秒读入 {swap_in} · 写出 {swap_out}",
+                     f"Swap | {sample.elapsed:.1f}s average · in {swap_in}/s · out {swap_out}/s"), animate)
+    cpu_idle = (tr(f"整机空闲 {idle:.1f}%", f"{idle:.1f}% system idle") if idle is not None
+                else tr("整机空闲率不可用", "system idle unavailable"))
+    type_line(tr("CPU｜", "CPU | ") + cpu_idle, animate)
+    type_line(tr(f"磁盘｜系统盘可用 {amount(sample.disk_free)}",
+                 f"Disk | system volume free {amount(sample.disk_free)}"), animate)
+
+    explained = set()
+    for title, names, field, entries in (
+        (sample.metric, by_memory, "memory", groups),
+        (sample.cpu_title, by_cpu, "cpu", cpu_groups),
+    ):
+        if not names:
+            continue
+        print(tr(f"\n{title}排行（按应用或进程归并）", f"\nTop by {title} (grouped by app or process)"))
+        for name in names[:args.limit]:
+            members = entries[name]
+            value = sum(getattr(p, field) for p in members)
+            highest = max(members, key=lambda p: getattr(p, field))
+            label = amount(value) if field == "memory" else f"{value:.1f}%"
+            group = terminal_text(name)
+            peak = f"{terminal_text(highest.name)} (PID {highest.pid})"
+            type_line(tr(f"  {label}  {group} · {len(members)} 个进程 · 最高 {peak}",
+                         f"  {label}  {group} · {len(members)} process(es) · top: {peak}"), animate)
+            note = system_note(name) or system_note(highest.name)
+            if note and note not in explained:
+                type_line(tr("    ↳ 系统进程｜", "    ↳ System process | ") + note, animate)
+                explained.add(note)
+        if field == "memory":
+            show_memory_tail(names, entries, args.limit, animate)
+
+    if not groups:
+        print(tr("\n没有可用的进程内存样本。", "\nNo process memory samples available."))
+    heading(tr("02  现场结论", "02  Findings"))
+    type_line(tr("，", " ").join(findings) if findings else
+              tr("短采样未发现明确瓶颈", "No clear bottleneck during this sample.") if measured
+              else tr("部分采样不可用，暂时无法确定瓶颈", "Some samples are missing. No reliable diagnosis yet."), animate)
+    if low_disk:
+        print(tr("  • 先把系统盘上能归档的大文件移走。", "  • Move large files you can archive off the system drive."))
+    cpu_first = busy_cpu and not (pressure in {"2", "4"} or active_swap)
+    candidates, entries = (by_cpu, cpu_groups) if cpu_first else (by_memory, groups)
+    if findings or pressure not in PRESSURE or idle is None:
+        suggested = [name for name in candidates if not system_note(name)]
+        for name in suggested[:3]:
+            type_line(f"  • {terminal_text(name)}{tr('。', ': ')}{action(name, entries[name])}", animate)
+    if findings:
+        print(tr("  • 先处理一个确认闲置的高占用项，等约 30 秒再跑一次。", "  • Quit one heavy app you know is idle. Wait about 30 seconds, then rerun."))
+    else:
+        print(tr("  • 如果卡顿重现，在卡顿时用 --seconds 5 再测。", "  • If it bogs down again, rerun with --seconds 5 while it's happening."))
+    if findings:
+        print(tr("  • 卡到界面都动不了，或关掉大户后还持续卡，先保存再重启。",
+                 "  • If the UI is nearly unusable or quitting heavy apps doesn't help, save and reboot."))
+    print()
+    type_line(roast(pressure, swap_rate, busy_cpu, low_disk, measured), animate,
+              "1;31" if findings else "1;32")
+    can_quit = sys.platform == "win32" or os.getuid() != 0
+    if interactive and (busy_cpu or active_swap or pressure in {"2", "4"}) and can_quit:
+        targets = quit_targets(candidates, entries, tree, cpu_first, min(args.limit, 5))
+        quit_menu(targets, animate)
+    return 0 if groups else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
